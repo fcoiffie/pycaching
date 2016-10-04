@@ -6,7 +6,8 @@ import requests
 import bs4
 import json
 import subprocess
-from urllib.parse import urljoin
+import re
+from urllib.parse import urljoin, urlparse
 from os import path
 from pycaching.cache import Cache, Type, Size
 from pycaching.log import Log, Type as LogType
@@ -28,6 +29,7 @@ class Geocaching(object):
         "login_page":        "account/login",
         "search":            "play/search",
         "search_more":       "play/search/more-results",
+        "my_logs":           "my/logs.aspx",
     }
     _credentials_file = ".gc_credentials"
 
@@ -322,6 +324,94 @@ class Geocaching(object):
         :param str location: Location to geocode.
         """
         return Point.from_location(self, location)
+
+    def get_not_found_caches_guid(self):
+        logging.info("Searching not found caches")
+        return self._caches_get_page(3)
+
+    def get_found_caches_guid(self):
+        logging.info("Searching found caches")
+        return self._caches_get_page(2)
+
+    def _caches_get_page(self, key):
+        # make request
+        res = self._request(self._urls["my_logs"], params={
+            "s": 1,
+            "lt": key,
+        })
+
+        caches = []
+        links = res.findAll(href=re.compile(r'.+cache_details.aspx\?guid=\w+'))
+        for l in links:
+            guid = urlparse(l.get("href")).query.split('=')[1]
+            if guid not in caches:
+                caches.append(guid)
+        return caches
+
+    def get_cache_coord_by_guid(self, guid):
+        info_soup = self._request("/seek/cdpf.aspx", params={
+            "guid": guid,
+        })
+        #print(info_soup.prettify())
+
+        def _lookup_by_header(soup, header):
+            for h2 in soup.findAll("h2"):
+                if header in h2.text:
+                    div = h2.findParent().findParent()
+                    return div.find("div", {"class": "item-content"})
+
+        tmp = _lookup_by_header(info_soup, "Short Description")
+        if tmp is not None:
+            short_desc = re.sub(r'\s+', ' ', tmp.text.strip())
+        else:
+            short_desc = ""
+        tmp = _lookup_by_header(info_soup, "Long Description")
+        if tmp is not None:
+            long_desc = tmp.renderContents().decode('utf-8')
+        else:
+            long_desc = ""
+
+        try:
+            h = _lookup_by_header(info_soup, "Additional Hints")
+            if h is not None:
+                decr = h.find("div", {"class": "hint-encrypted"})
+                hints = decr.text.strip()
+        except AttributeError:
+            hints = "No hint"
+
+        #print "Short: ", short_desc
+        #print "Long:  ", long_desc
+        #print "Hints: ", hints
+
+        gps = None
+
+        gpsitem = info_soup.find("p", {"class": "LatLong Meta"})
+        if gpsitem != None:
+            gpstext = gpsitem.text.strip()
+            #print("'%s'" % (gpstext))
+            m = re.match("(N|S)\s*([0-9]+).\s*([\.0-9]+)\s*(E|W)\s*([0-9]+).\s*([\.0-9]+)", gpstext)
+            if m != None:
+                lat = float(m.group(2)) + float(m.group(3)) / 60.0
+                if m.group(1) != 'N':
+                    lat = -lat
+
+                lon = float(m.group(5)) + float(m.group(6)) / 60.0
+                if m.group(4) != 'E':
+                    lon = -lon
+
+                gps = (lat, lon)
+        else:
+            #print(info_soup.prettify())
+            r = re.compile(".*var lat=([\-\.0-9]+), lng=([\-\.0-9]+), wptid.*", re.MULTILINE|re.DOTALL)
+            m = r.match(info_soup.prettify())
+            if m != None:
+                lat = float(m.group(1))
+                lon = float(m.group(2))
+                gps = (lat, lon)
+            else:
+                logging.error("Cannot retrieve GPS position for cache {}".format(guid))
+
+        return gps
 
     def get_cache(self, wp):
         """Return a :class:`.Cache` object by its waypoint.
